@@ -5,6 +5,9 @@ using System.Net.Mail;
 using System.Data;
 using System.Data.SqlClient;
 using System.Configuration;
+using ClosedXML.Excel;
+using System.IO;
+using System.Threading;
 
 namespace smcSummaryTrans
 {
@@ -15,10 +18,10 @@ namespace smcSummaryTrans
             string mailServer = "142.1.10.30";
             string fromMail = "no-reply@kingpower.com";
             string toMail = ConfigurationManager.AppSettings["toEmail"];
-            string subject = "[Auto mail]["+ DateTime.Now.ToString("dd/MM/yyyy") +"] Daily summary data for reconcile SMC and Mulesoft"; 
+            string subject = "[Auto mail][" + DateTime.Now.ToString("dd/MM/yyyy") + "] Daily summary data for reconcile SMC and Mulesoft";
             string bodyMail = "<h3>Daily summary data for reconcile SMC and Mulesoft</h3><br>";
             bool isBodyHtml = true;
-            List<string> pdf = new List<string>();
+            List<string> attachFile = new List<string>();
 
             string sqlQuery;
             DataTable resultDataTable;
@@ -27,30 +30,53 @@ namespace smcSummaryTrans
             // SMC Account Sync
             bodyMail += "<p>SMC Account Sync</p>";
             sqlQuery = "SELECT [Date] ,[Total] ,[Success] ,[Fail] FROM [Newmember].[dbo].[v_member_sum_triggerToMulesoft_all];";
-            resultDataTable = sqlQueryExecutor.QueryDataWithTransaction(sqlQuery);
+            resultDataTable = sqlQueryExecutor.ExecuteQueryWithRetry(sqlQuery);
             bodyMail += ConvertDataTableToHtml(resultDataTable);
 
             // New Registration
             bodyMail += "<br><p>New Registration</p>";
             sqlQuery = "SELECT [Date] ,[Total] ,[Success] ,[Fail] FROM [Newmember].[dbo].[v_member_sum_triggerToMulesoft_insert];";
-            resultDataTable = sqlQueryExecutor.QueryDataWithTransaction(sqlQuery);
+            resultDataTable = sqlQueryExecutor.ExecuteQueryWithRetry(sqlQuery);
             bodyMail += ConvertDataTableToHtml(resultDataTable);
 
             // lv and spend
             bodyMail += "<br><p>LV transaction</p>";
             sqlQuery = "SELECT [Date],[Total] FROM [Newmember].[dbo].[v_member_sum_lvSpendTrans_all];";
-            resultDataTable = sqlQueryExecutor.QueryDataWithTransaction(sqlQuery);
+            resultDataTable = sqlQueryExecutor.ExecuteQueryWithRetry(sqlQuery);
             bodyMail += ConvertDataTableToHtml(resultDataTable);
 
             // Co-brand
             bodyMail += "<br><p>Co-Brand</p>";
             sqlQuery = "SELECT [Date],[Total],[KBankClose] FROM [Newmember].[dbo].[v_member_sum_cobrandTrans_all];";
-            resultDataTable = sqlQueryExecutor.QueryDataWithTransaction(sqlQuery);
+            resultDataTable = sqlQueryExecutor.ExecuteQueryWithRetry(sqlQuery);
             bodyMail += ConvertDataTableToHtml(resultDataTable);
 
+            // Error data
+            sqlQuery = "SELECT [transType],[member_id],[shopping_card],[response_time],[response_message] FROM [Newmember].[dbo].[v_member_error_trigger_trans];";
+            DataTable errorResult = sqlQueryExecutor.ExecuteQueryWithRetry(sqlQuery);
+
+            // Convert DataTable to XLSX
+            byte[] excelFileBytes = DataTableToExcel(errorResult);
+
+            // Get the current directory path
+            string currentDirectory = Environment.CurrentDirectory;
+            //string excelFilePath = "SMC_MemberProfile_Trigger_Error_" + DateTime.Now.ToString("yyyyMMdd") + ".xlsx";
+            string excelFilePath = "SMC_MemberProfile_Trigger_Error.xlsx";
+            string fullPath = System.IO.Path.Combine(currentDirectory, excelFilePath);
+
+            // Save XLSX content to a file
+            if (excelFileBytes != null) 
+            { 
+                File.WriteAllBytes(fullPath, excelFileBytes);
+                attachFile.Add(fullPath);
+            }
+
             // send email
-            var rs = SendMail(mailServer, fromMail, toMail, subject, bodyMail, isBodyHtml, pdf);
+            var rs = SendMail(mailServer, fromMail, toMail, subject, bodyMail, isBodyHtml, attachFile);
             Console.WriteLine(rs);
+
+            // Delete the XLSX file after sending the email
+            //DeleteXLSXFile(fullPath);
         }
         static string ConvertDataTableToHtml(DataTable dataTable)
         {
@@ -82,6 +108,84 @@ namespace smcSummaryTrans
             htmlStringBuilder.AppendLine("</table>");
 
             return htmlStringBuilder.ToString();
+        }
+
+        static byte[] DataTableToExcel(DataTable dataTable)
+        {
+            using (var workbook = new XLWorkbook())
+            {
+                var worksheet = workbook.Worksheets.Add("Sheet1");
+
+                // Write header
+                for (int col = 0; col < dataTable.Columns.Count; col++)
+                {
+                    worksheet.Cell(1, col + 1).Value = dataTable.Columns[col].ColumnName;
+                }
+
+                // Write data
+                for (int row = 0; row < dataTable.Rows.Count; row++)
+                {
+                    for (int col = 0; col < dataTable.Columns.Count; col++)
+                    {
+                        worksheet.Cell(row + 2, col + 1).Value = dataTable.Rows[row][col].ToString();
+                    }
+                }
+
+                // Save the workbook to a memory stream
+                using (var stream = new MemoryStream())
+                {
+                    workbook.SaveAs(stream);
+                    return stream.ToArray();
+                }
+            }
+        }
+
+        static string QuoteField(string field)
+        {
+            // If the field contains a comma, quote it
+            if (field.Contains(","))
+                return $"\"{field}\"";
+            else
+                return field;
+        }
+
+        static void DeleteXLSXFile(string filePath)
+        {
+            int maxAttempts = 3;
+            int attemptDelayMilliseconds = 1000;
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    // Check if the file exists before attempting to delete
+                    if (File.Exists(filePath))
+                    {
+                        // Ensure the file is not open or in use
+                        using (FileStream fs = File.Open(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                        {
+                            // Add your logic here if you need to perform operations on the file before deletion
+                        }
+
+                        // Attempt to delete the file after ensuring it's not in use
+                        File.Delete(filePath);
+                        Console.WriteLine("File deleted successfully.");
+                        break; // Exit the loop if deletion is successful
+                    }
+                    else
+                    {
+                        Console.WriteLine("File does not exist.");
+                        break; // Exit the loop if the file does not exist
+                    }
+                }
+                catch (IOException ex)
+                {
+                    Console.WriteLine($"Error deleting the file (Attempt {attempt}/{maxAttempts}): {ex.Message}");
+
+                    // Sleep before the next attempt
+                    Thread.Sleep(attemptDelayMilliseconds);
+                }
+            }
         }
 
         public static string SendMail(string mailServer, string fromMail, string toMail, string subject, string bodyMail, bool isBodyHtml = false, List<string> attachFile = null)
@@ -127,51 +231,49 @@ namespace smcSummaryTrans
     {
         private string connectionString = "Data Source=member-server;Initial Catalog=Newmember;User ID=sa;Password=sql2000;";
 
-        public DataTable QueryDataWithTransaction(string sqlQuery)
+        public DataTable ExecuteQueryWithRetry(string sqlCommandText)
         {
-            DataTable resultDataTable = new DataTable();
+            int maxRetries = int.Parse(ConfigurationManager.AppSettings["max_retry"].ToString());
+            int retryCount = 0;
 
-            using (SqlConnection connection = new SqlConnection(connectionString))
+            while (retryCount < maxRetries)
             {
-                connection.Open();
-
-                // Start a transaction
-                SqlTransaction transaction = connection.BeginTransaction();
-
                 try
                 {
-                    // Execute your SQL query within the transaction
-                    using (SqlCommand command = connection.CreateCommand())
+                    using (SqlConnection connection = new SqlConnection(connectionString))
                     {
-                        command.Transaction = transaction;
-                        command.CommandText = sqlQuery;
+                        connection.Open();
 
-                        using (SqlDataAdapter adapter = new SqlDataAdapter(command))
+                        using (SqlCommand command = new SqlCommand(sqlCommandText, connection))
                         {
-                            // Fill the DataTable with the result of the query
-                            adapter.Fill(resultDataTable);
+
+                            // Create a DataTable to hold the results
+                            DataTable resultTable = new DataTable();
+
+                            // Use a DataAdapter to fill the DataTable
+                            using (SqlDataAdapter adapter = new SqlDataAdapter(command))
+                            {
+                                adapter.Fill(resultTable);
+                            }
+
+                            return resultTable; // Query successful, return the DataTable
                         }
                     }
-
-                    // Commit the transaction if everything is successful
-                    transaction.Commit();
-                    Console.WriteLine("Transaction committed successfully!");
                 }
-                catch (Exception ex)
+                catch (SqlException ex)
                 {
-                    // Handle exceptions and roll back the transaction in case of an error
+                    // Handle the exception, you might want to log it or perform some specific actions
                     Console.WriteLine($"Error: {ex.Message}");
-                    transaction.Rollback();
-                }
-                finally
-                {
-                    // Close the connection in the finally block to ensure it's always closed
-                    connection.Close();
-                    Console.WriteLine("Connection closed.");
+
+                    // Increment the retry count
+                    retryCount++;
+
+                    // Wait for a short period before the next retry (optional)
+                    Thread.Sleep(1000);
                 }
             }
 
-            return resultDataTable;
+            return null; // Unable to execute the query after maximum retries
         }
     }
 }
